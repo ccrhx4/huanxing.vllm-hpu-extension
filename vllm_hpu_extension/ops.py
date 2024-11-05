@@ -144,6 +144,8 @@ def flat_pa(query, key_cache, value_cache, block_list, block_mapping,
     q_heads = query.size(1)
     kv_heads = key_cache.size(2)
 
+    query = query.to(torch.float)
+    block_mapping = block_mapping.to(torch.float)
     query = batch2block(scale * query, block_mapping).unsqueeze(-2)
     key = keys_fetch_func(key_cache, block_list).transpose(1, 2)
     value = values_fetch_func(value_cache, block_list).transpose(1, 2)
@@ -156,6 +158,11 @@ def flat_pa(query, key_cache, value_cache, block_list, block_mapping,
         key = key.transpose(3, 4)
     else:
         key = key.transpose(2, 3)
+    
+    key = key.to(torch.float)
+    value = value.to(torch.float)
+    block_bias = block_bias.to(torch.float)
+    block_scales= block_scales.to(torch.float)
 
     attn = matmul_qk_op(query, key) + block_bias
     attn = block_softmax(batch_size, attn, block_mapping, block_scales, block_groups)
@@ -164,6 +171,7 @@ def flat_pa(query, key_cache, value_cache, block_list, block_mapping,
     attn = attn.squeeze(-2)
     if kv_heads != q_heads:
         attn = attn.flatten(1, 2)
+    attn = attn.to(torch.bfloat16)
     return attn
 
 
@@ -225,10 +233,14 @@ def prompt_attention(
             value = repeat_kv(value, int(query_heads // kv_heads))
         softmax_mode = 'None'
         recompute_mode = True
+        query = query.to(torch.float)
+        key = key.to(torch.float)
+        value = value.to(torch.float)
         attn_weights = FusedSDPA.apply(query, key, value, None, 0.0, True,
                                        scale, softmax_mode, recompute_mode,
                                        valid_seq_lengths, 'right')
     attn_weights = attn_weights.transpose(1, 2)
+    attn_weights = attn_weights.to(torch.bfloat16)
     return attn_weights
 
 
