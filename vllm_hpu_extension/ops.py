@@ -14,7 +14,7 @@ import math
 import habana_frameworks.torch.core as htcore
 
 from vllm.logger import init_logger
-from vllm_hpu_extension.capabilities import capabilities
+
 
 logger = init_logger(__name__)
 HPUFusedRMSNorm = None
@@ -25,11 +25,17 @@ except ImportError:
     logger.warning("Could not import HPU FusedRMSNorm kernel. "
                    "vLLM will use forward_native implementation of RMSNorm.")
 
+FP32_SOFTMAX = os.environ.get('VLLM_FP32_SOFTMAX', 'False').lower() == 'true'
+
 
 def grouped_max(block_max, batch_size, block_groups):
+    orig_dtype = block_max.dtype
+    if orig_dtype == torch.float16:
+        # fp16 index_reduce is not supported ATM
+        block_max = block_max.to(torch.float32)
     group_max = torch.full([batch_size + 1, *block_max.shape[1:]], -math.inf,
                            dtype=block_max.dtype, device=block_max.device)
-    group_max = group_max.index_reduce_(0, block_groups, block_max, 'amax')
+    group_max = group_max.index_reduce_(0, block_groups, block_max, 'amax').to(orig_dtype)
     group_max = group_max.index_select(0, block_groups)
     return group_max
 
@@ -49,60 +55,41 @@ def block2batch(tensor, block_mapping, matmul_op=torch.matmul):
 
 def pipelined_pa(attn, value, block_groups, block_mapping, block_scales, batch_size,
                  matmul_av_op, batch2block_matmul_op, block2batch_matmul_op):
-    # Normalize the attention scores
+    # When fp32_softmax is enabled attn is left in fp32 after Q@K
+    # We can return to native dtype after we renormalize and calculate the adjustments
+    
+    # Normalize the attention scores and cast attn to native dtype
     block_max = attn.amax(dim=-1, keepdim=True)
     adjustment_target_shape = block_max.shape
     attn = attn.sub(block_max)
     attn = attn.exp()
+    attn = attn.to(value.dtype)
     block_sums = attn.sum(dim=-1, keepdim=True)
     attn = matmul_av_op(attn, value)
     block_max = block_max.squeeze()
     block_sums = block_sums.squeeze()
+
     # Calculate maximum of blocks that belong to the same sequences
+    # and cast adjustments to native dtype
     group_max = grouped_max(block_max, batch_size, block_groups)
     block_adjustment = (block_max - group_max).exp()
+    block_adjustment = block_adjustment.to(value.dtype)
     sum_adjusted = block_sums.mul(block_adjustment)
-    # Sum block's sums that belongs to the same sequeneces
+
+    # Sum block's sums that belongs to the same sequences
     group_sum_adjusted = block2batch(sum_adjusted, block_mapping, block2batch_matmul_op)
     group_sum_adjusted = batch2block(group_sum_adjusted, block_mapping, batch2block_matmul_op)
     sum_adjusted = sum_adjusted.view(*adjustment_target_shape)
     group_sum_adjusted = group_sum_adjusted.view(*adjustment_target_shape)
     block_adjustment = block_adjustment.view(*adjustment_target_shape)
+
     # For stability in case some of the sums have been zeroed out during block aggretation
     group_sum_adjusted = torch.maximum(group_sum_adjusted, sum_adjusted)
+
     # Post processing for the attention scores
     rescale = block_adjustment.div(group_sum_adjusted)
     attn = attn.mul(rescale)
     return attn
-
-
-def pa(attn, value, block_groups, block_mapping, block_scales, batch_size,
-       matmul_av_op, batch2block_matmul_op, block2batch_matmul_op):
-    attn_max = attn.amax(-1)
-    missing_dims = attn_max.dim() - block_scales.dim()
-    block_sum_attn = attn_max.mul(block_scales.reshape(-1, *[1 for _ in range(missing_dims)]))
-    block_sum_attn = block2batch(block_sum_attn, block_mapping, block2batch_matmul_op)
-    block_sum_attn = batch2block(block_sum_attn, block_mapping, batch2block_matmul_op)
-    attn.sub_(block_sum_attn.unsqueeze(-1))
-    attn_max.sub_(block_sum_attn)
-    attn_max = attn_max.amax(0, keepdim=True)
-    attn.sub_(attn_max.unsqueeze(-1))
-    attn = attn.exp()
-    sums = attn.sum(dim=-1).unsqueeze(-1)
-    block_sum = sums
-    # Sum block's sums that belongs to the same sequeneces
-    sums = block2batch(sums, block_mapping, block2batch_matmul_op)
-    group_sums = batch2block(sums, block_mapping, batch2block_matmul_op)
-    group_sums.add_(torch.finfo(group_sums.dtype).tiny)
-    group_sums = torch.maximum(block_sum, group_sums)
-    attn.div_(group_sums)
-    attn = matmul_av_op(attn, value)
-    return attn
-
-
-pipelined_pa_enabled = 'True' if "index_reduce" in capabilities() else 'False'
-pipelined_pa_enabled = os.environ.get('VLLM_PIPELINED_PA', pipelined_pa_enabled).lower() == 'true'
-pa_impl = pipelined_pa if pipelined_pa_enabled else pa
 
 
 def flat_pa(query, key_cache, value_cache, block_list, block_mapping,
@@ -126,10 +113,14 @@ def flat_pa(query, key_cache, value_cache, block_list, block_mapping,
     else:
         key = key.transpose(2, 3)
 
-    attn = matmul_qk_op(query, key) + block_bias
-    attn = pa_impl(attn, value, block_groups, block_mapping, block_scales=block_scales,
-                   batch_size=batch_size, matmul_av_op=matmul_av_op,
-                   batch2block_matmul_op=batch2block_matmul_op, block2batch_matmul_op=block2batch_matmul_op)
+    attn = matmul_qk_op(query, key)
+    if FP32_SOFTMAX:
+        attn = attn.float()
+        htcore.mark_step()
+    attn = attn + block_bias
+    attn = pipelined_pa(attn, value, block_groups, block_mapping, block_scales=block_scales,
+                        batch_size=batch_size, matmul_av_op=matmul_av_op,
+                        batch2block_matmul_op=batch2block_matmul_op, block2batch_matmul_op=block2batch_matmul_op)
     attn = block2batch(attn, block_mapping, block2batch_matmul_op)
     attn = attn.squeeze(-2)
     if kv_heads != q_heads:
@@ -184,9 +175,13 @@ def prompt_attention(
             if attn_bias is not None:
                 attn_bias = attn_bias.unsqueeze(2)
         attn_weights = matmul_qk_op(query * scale, key.transpose(-1, -2))
+        if FP32_SOFTMAX:
+            attn_weights = attn_weights.float()
+            htcore.mark_step()
         if attn_bias is not None:
-            attn_weights.add_(attn_bias)
+            attn_weights = attn_weights.add(attn_bias)
         attn_weights = softmax_op(attn_weights, dim=-1)
+        attn_weights = attn_weights.to(query.dtype)
         attn_weights = matmul_av_op(attn_weights, value)
         if query_heads != kv_heads:
             attn_weights = attn_weights.flatten(1, 2)
@@ -322,7 +317,6 @@ def dispatch_bgmv_embedding(
     x: torch.Tensor,
     wb_t_all: torch.Tensor,
     layer_idx: int,
-    scale: float,
 ):
     """
     `wb_t_all` contains all LoRA-B weight matrices stacked at dimension 0 into
@@ -343,7 +337,7 @@ def dispatch_bgmv_embedding(
     wb = wb_t_all[:, 0, :, :].transpose(1, 2)
     wb = wb.reshape(wb.shape[0] * wb.shape[1], wb.shape[2])
     out = x @ wb
-    y += out * scale
+    y += out
 
 
 class MoeMatmul(torch.nn.Module):
@@ -429,7 +423,7 @@ class DynamicFusedMOE(torch.nn.Module):
             permuted_weights=True,
             activation="silu",
             experts_min=0,
-            experts_max=7
+            experts_max=self.num_total_experts
         )
 
         return final_hidden_states.view(-1, hidden_states.shape[1])
