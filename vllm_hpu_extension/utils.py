@@ -10,15 +10,18 @@ import os
 from functools import lru_cache
 
 import habana_frameworks.torch as htorch
+import habana_frameworks.torch.utils.experimental as htexp
 import torch
 
 from .cache_ops import insert_or_update_cache
-
 
 @lru_cache(maxsize=None)
 def is_fake_hpu() -> bool:
     return os.environ.get('VLLM_USE_FAKE_HPU', '0') != '0'
 
+# FIXME: check current_platform.is_hpu() causes cyclic import
+def is_gaudi2():
+    return htexp._get_device_type() == htexp.synDeviceType.synDeviceGaudi2
 
 def with_mark_steps(fn):
 
@@ -56,8 +59,9 @@ class VLLMKVCache(torch.nn.Module):
 
     def __init__(self):
         super(VLLMKVCache, self).__init__()
-        self.use_contiguous_pa = os.environ.get('VLLM_CONTIGUOUS_PA',
-                                                'true').lower() == 'true'
+        self.use_contiguous_pa = (os.environ.get(
+            "VLLM_CONTIGUOUS_PA",
+            "false" if is_gaudi2() else "true").lower() == "true")
 
     def forward(self, input, cache, block_indices, block_offset):
         insert_or_update_cache(input, cache, block_indices, block_offset)
