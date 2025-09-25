@@ -124,6 +124,13 @@ def warmup_range(config: Tuple[int, int, int]):
     buckets = list(ramp_up_tw) + list(stable)
     return list(filter(lambda bucket: bucket >= bmin, buckets))
 
+def is_skip_3d_warmup_true():
+    val = os.getenv("VLLM_SKIP_3D_WARMUP")
+    if val is None:
+        return False
+    # Normalize case
+    val_lower = val.strip().lower()
+    return val_lower in ("true", "1", "yes", "on")
 
 def generate_prompt_buckets(bs_bucket_config,
                             seq_bucket_config,
@@ -134,7 +141,9 @@ def generate_prompt_buckets(bs_bucket_config,
     batch_size_buckets = warmup_range(bs_bucket_config)
     seq_bucket_config = warmup_range(seq_bucket_config)
 
-    if prefix_caching:
+    is_skip_3d_warmup = is_skip_3d_warmup_true()
+
+    if prefix_caching and is_skip_3d_warmup is False:
         buckets_3d = []
         for bs in batch_size_buckets:
             for b in seq_bucket_config:
@@ -142,10 +151,17 @@ def generate_prompt_buckets(bs_bucket_config,
                 for i in range(0, max_blocks_range + 2):
                     buckets_3d.append((bs, b, i))
         buckets = buckets_3d
+    elif prefix_caching and is_skip_3d_warmup:
+        # to test if we can skip warmup for context dim in APC
+        print("skip 3d warmup! ")
+        buckets = list(
+                itertools.product(batch_size_buckets,
+                                seq_bucket_config, [0]))
     else:
         buckets = list(
                 itertools.product(batch_size_buckets,
                                 seq_bucket_config, [0]))
+
 
     if len(buckets) == 0:
         msg = ("No buckets could be captured with following config "

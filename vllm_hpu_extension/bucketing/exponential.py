@@ -84,6 +84,13 @@ class ExponentialBucketingStrategy():
 
         return sorted(decode_buckets)
 
+def is_skip_3d_warmup_true():
+    val = os.getenv("VLLM_SKIP_3D_WARMUP")
+    if val is None:
+        return False
+    # Normalize case
+    val_lower = val.strip().lower()
+    return val_lower in ("true", "1", "yes", "on")
 
 def generate_prompt_buckets(bs_bucket_config,
                             seq_bucket_config,
@@ -98,24 +105,31 @@ def generate_prompt_buckets(bs_bucket_config,
         long_context = True
     seq_bucket_config = warmup_range_with_limit(seq_bucket_config, long_context=long_context)
 
-    if prefix_caching:
-        buckets_3d = []
-        for bs in batch_size_buckets:
-            for b in seq_bucket_config:
-                buckets_3d.append((bs, b, 0))
-                max_blocks_range = (bmax - b) // block_size
-                if max_blocks_range == 0:
-                    continue
-                else:
-                    num_buckets_3d = math.ceil(math.log2(max_blocks_range)) + 1
+    is_skip_3d_warmup = is_skip_3d_warmup_true()
 
-                for i in range(1, num_buckets_3d + 1):
-                    power_unpadded = 1 * np.float_power(
+    if prefix_caching:
+        if is_skip_3d_warmup:
+            buckets = list(
+                    itertools.product(batch_size_buckets,
+                                    seq_bucket_config, [0]))
+        else:
+            buckets_3d = []
+            for bs in batch_size_buckets:
+                for b in seq_bucket_config:
+                    buckets_3d.append((bs, b, 0))
+                    max_blocks_range = (bmax - b) // block_size
+                    if max_blocks_range == 0:
+                        continue
+                    else:
+                        num_buckets_3d = math.ceil(math.log2(max_blocks_range)) + 1
+
+                    for i in range(1, num_buckets_3d + 1):
+                        power_unpadded = 1 * np.float_power(
                         max_blocks_range, (1 / float(num_buckets_3d)) * i)
                     new_bucket = math.ceil(power_unpadded)
                     buckets_3d.append((bs, b, new_bucket))
 
-        buckets = buckets_3d
+            buckets = buckets_3d
     else:
         buckets = list(
                 itertools.product(batch_size_buckets,

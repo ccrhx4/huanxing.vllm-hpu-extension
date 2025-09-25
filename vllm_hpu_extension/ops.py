@@ -318,6 +318,18 @@ def _naive_prompt_attention(
     attn_weights = attn_weights.transpose(1, 2)
     return attn_weights
 
+def is_disable_fsdpa_compile_true():
+    val = os.getenv("VLLM_DISABLE_COMPILE_FSDPA")
+    if val is None:
+        return False
+    val_lower = val.strip().lower()
+    return val_lower in ("true", "1", "yes", "on")
+
+def conditional_disable_compiler(function):
+    if is_disable_fsdpa_compile_true():
+        return torch.compiler.disable()(function)
+    else:
+        return function
 
 def _fsdpa_prompt_attention(
         query: torch.Tensor,
@@ -363,7 +375,7 @@ def _fsdpa_prompt_attention(
     attn_weights = attn_weights.transpose(1, 2)
     return attn_weights
 
-
+@conditional_disable_compiler
 def prompt_attention(
         impl: str,
         **args,

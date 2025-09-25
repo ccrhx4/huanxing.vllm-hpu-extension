@@ -3,6 +3,8 @@ import bisect
 import math
 from typing import Dict
 import inspect
+import os
+
 from dataclasses import dataclass, field
 from typing import List, Tuple
 
@@ -180,6 +182,13 @@ class HPUBucketingManager():
         """
         return cls._instance
 
+def is_skip_3d_warmup_true():
+    val = os.getenv("VLLM_SKIP_3D_WARMUP")
+    if val is None:
+        return False
+    # Normalize case
+    val_lower = val.strip().lower()
+    return val_lower in ("true", "1", "yes", "on")
 
 def get_bucketing_manager():
     instance = HPUBucketingManager.get_instance()
@@ -187,13 +196,19 @@ def get_bucketing_manager():
 
 
 def is_greater_or_equal(tuple1, tuple2):
+    if is_skip_3d_warmup_true():
+        return tuple1[0] >= tuple2[0] and tuple1[1] >= tuple2[1]
+
     return tuple1[0] >= tuple2[0] and tuple1[1] >= tuple2[1] \
            and tuple1[2] >= tuple2[2]
 
 
 def find_equal_or_closest_greater_config(sorted_list, target_tuple):
+    print("find buckets: ", target_tuple)
+
     idx = bisect.bisect_left(sorted_list, target_tuple)
     for i in range(idx, len(sorted_list)):
+        print("find buckets: ", sorted_list[i])
         if is_greater_or_equal(sorted_list[i], target_tuple):
             return sorted_list[i]
     return None
