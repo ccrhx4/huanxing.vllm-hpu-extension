@@ -204,12 +204,11 @@ def is_greater_or_equal(tuple1, tuple2):
 
 
 def find_equal_or_closest_greater_config(sorted_list, target_tuple):
-    print("find buckets: ", target_tuple)
-
+    logger().debug(f"Find bucket: target {target_tuple}")
     idx = bisect.bisect_left(sorted_list, target_tuple)
     for i in range(idx, len(sorted_list)):
-        print("after bisect: ", sorted_list[i])
         if is_greater_or_equal(sorted_list[i], target_tuple):
+            logger().debug(f"Found bucket: {sorted_list[i]}")
             return sorted_list[i]
     return None
 
