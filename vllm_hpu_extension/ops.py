@@ -12,6 +12,7 @@ import math
 import habana_frameworks.torch.core as htcore
 from vllm_hpu_extension.runtime import get_config
 import habana_frameworks.torch.utils.experimental as htexp
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 is_hpu_gaudi2 = htexp._get_device_type(
     ) == htexp.synDeviceType.synDeviceGaudi2
@@ -263,6 +264,40 @@ def _flex_prompt_attention(
     attn_weights = attn_weights.transpose(1, 2)
     return attn_weights
 
+def _sdpa_prompt_attention(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        scale: float,
+        is_causal: bool,
+        attn_bias: Optional[torch.Tensor] = None,
+        position_bias: Optional[torch.Tensor] = None,
+        matmul_qk_op=torch.matmul,
+        softmax_op=torch.softmax,
+        matmul_av_op=torch.matmul,
+        **ignored_args
+) -> torch.Tensor:
+    query = query.transpose(1, 2)
+    key = key.transpose(1, 2)
+    value = value.transpose(1, 2)
+    query_heads = query.size(1)
+    kv_heads = key.size(1)
+    if query_heads != kv_heads:
+        query = query.unflatten(1, (kv_heads, -1))
+        key = key.unflatten(1, (kv_heads, 1))
+        value = value.unflatten(1, (kv_heads, 1))
+        if position_bias is not None:
+            position_bias = position_bias.unflatten(1, (kv_heads, -1))
+        if attn_bias is not None:
+            attn_bias = attn_bias.unsqueeze(2)
+    with sdpa_kernel([SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION]):
+        attn_weights = torch.nn.functional.scaled_dot_product_attention(query, key, value,
+            None, dropout_p=0.0,is_causal=is_causal, scale=scale)
+    
+    if query_heads != kv_heads:
+        attn_weights = attn_weights.flatten(1, 2)
+    attn_weights = attn_weights.transpose(1, 2)
+    return attn_weights
 
 def _naive_prompt_attention(
         query: torch.Tensor,
@@ -369,7 +404,6 @@ def _fsdpa_prompt_attention(
                                 valid_seq_lengths, padding_side]
     args += [window_size] if window_size else []
 
-
     attn_weights = fsdpa_op(*args)
 
     attn_weights = attn_weights.transpose(1, 2)
@@ -382,7 +416,7 @@ def prompt_attention(
 ) -> torch.Tensor:
     _get_context(args)
     impl_mapping = {
-        'naive_impl': _naive_prompt_attention,
+        'naive_impl': _sdpa_prompt_attention,
         'fsdpa_impl': _fsdpa_prompt_attention,
         'flex_impl': _flex_prompt_attention,
     }
